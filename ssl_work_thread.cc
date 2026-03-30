@@ -30,6 +30,7 @@
 #include <linux/sockios.h>
 
 #include "channel.h"
+#include "fd_dispatcher.h"
 
 
 namespace VPN
@@ -674,24 +675,11 @@ namespace VPN
             LOG_ERROR("不支持的密码套件.\n");
             exit(1);
         }
-#if 0
-        if (useTLS13)
-        {
-            LOG_INFO("enable tls13 sm2 sign\n");
-            // tongsuo中tls1.3不强制签名使用sm2签名，使用开关控制，对应客户端指定密码套件SSL_CTX_set_ciphersuites(ctx, "TLS_SM4_GCM_SM3");
-            SSL_CTX_enable_sm_tls13_strict(_sslCtx);
-            SSL_CTX_set1_curves_list(_sslCtx, "SM2:X25519:prime256v1");
-        }
-#endif
         // 设置密码套件
         if (tlsCipher.size() > 0)
         {
             LOG_INFO("使用密码套件列表: %s\n", tlsCipher.c_str());
             r = SSL_CTX_set_cipher_list(_sslCtx, tlsCipher.c_str());
-            // if(r != 1) {
-            //     LOG_ERROR("SSL_CTX_set_cipher_list failed\n");
-            //     exit(1);
-            // }
         }
         else
         {
@@ -864,7 +852,7 @@ namespace VPN
         return mktime(&t);
     }
 
-    int SSLThread::verifyCallback(int preverify_ok, X509_STORE_CTX* x509_ctx)
+    int SslWorkThread::verifyCallback(int preverify_ok, X509_STORE_CTX* x509_ctx)
     {
         LOG_INFO("SSLThread::%s preverify_ok: %d\n", __FUNCTION__, preverify_ok);
         // 获取客户端证书信息
@@ -885,21 +873,18 @@ namespace VPN
             LOG_INFO("无证书信息!\n");
         }
 
-        if (config()->_ignoreExpire == "on")
+        // 获取证书验证错误的详细情况
+        int err = X509_STORE_CTX_get_error(x509_ctx);
+        // int depth = X509_STORE_CTX_get_error_depth(x509_ctx);
+        if (err == X509_V_ERR_CERT_HAS_EXPIRED)
         {
-            // 获取证书验证错误的详细情况
-            int err = X509_STORE_CTX_get_error(x509_ctx);
-            int depth = X509_STORE_CTX_get_error_depth(x509_ctx);
-            if (err == X509_V_ERR_CERT_HAS_EXPIRED)
-            {
-                // 忽略证书过期错误
-                return 1;
-            }
+            // 忽略证书过期错误
+            return 1;
         }
         return preverify_ok;
     }
 
-    int SSLThread::verifyPasswordCallback(char* buf, int size, int rwflag, void* u)
+    int SslWorkThread::verifyPasswordCallback(char* buf, int size, int rwflag, void* u)
     {
         LOG_DEBUG("SSLThread::%s\n", __FUNCTION__);
         const char* pass = config()->_tlsKeyPass.c_str(); // 证书私钥密码
@@ -909,13 +894,13 @@ namespace VPN
         return strlen(pass);
     }
 
-    void SSLThread::createEpoll()
+    void SslWorkThread::createEpoll()
     {
         LOG_DEBUG("SSLThread::%s\n", __FUNCTION__);
         _epollFd = epoll_create1(EPOLL_CLOEXEC);
     }
 
-    void SSLThread::addEpollFd(std::shared_ptr<Channel> ch)
+    void SslWorkThread::addEpollFd(std::shared_ptr<Channel> ch)
     {
         LOG_DEBUG("SSLThread::%s\n", __FUNCTION__);
         struct epoll_event ev;
@@ -934,19 +919,15 @@ namespace VPN
         }
     }
 
-    void SSLThread::readDispatchMessage(int fd)
+    void SslWorkThread::readDispatchMessage(int fd)
     {
-        LOG_DEBUG("SSLThread::%s\n", __FUNCTION__);
         struct FdDispatchMsg msg;
         LOG_DEBUG("SSL Write thread readDispatchMessage: %d\n", fd);
         SocketPair::recvDispatchMsg(fd, &msg);
-        dispatchFd(msg._fd, msg._isIPv6);
-        LOG_INFO("_channelMap size: %d\n", _channelMap.size());
-        LOG_INFO("readDispatchMessage end, %d\n", fd);
-        //return msg._fd;
+        dispatchFd(msg._fd);
     }
 
-    void SSLThread::showClientCerts(SSL* ssl)
+    void SslWorkThread::showClientCerts(SSL* ssl)
     {
         LOG_DEBUG("SSLThread::%s\n", __FUNCTION__);
         // 获取客户端证书信息
@@ -968,274 +949,7 @@ namespace VPN
         }
     }
 
-    int SSLThread::pushTunConf(Channel* ch)
-    {
-        LOG_DEBUG("SSLThread::%s\n", __FUNCTION__);
-        int ret, writeLen = 0;
-        _isVirtualIpv6 = config()->_isVirtualIpv6;
-        unsigned char conf[512] = {0};
-        unsigned char packet[514] = {0};
-        unsigned int enpackLen = sizeof(packet);
-        cJSON* root = NULL;
-        SSL* ssl = ch->ssl_;
-
-        // 判断是否是ipv6
-        std::string svip6, cvip6, cidr6;
-        // 填充ipv6虚拟地址
-        if (_isVirtualIpv6)
-        {
-            svip6 = _vipPool->getsVip6();
-            // cvip6 = _vipPool->allocateVip6();
-            cvip6 = _vipPool->allocateVip6() + std::string("/") + _vipPool->getPrefixLen();
-            cidr6 = _vipPool->getcidr6();
-        }
-
-        // 填充iPV4虚拟地址
-        std::string svip, cvip, cidr, cmaskPrefixLen;
-        {
-            char vip[64] = {0};
-            unsigned int vipLen = sizeof(vip);
-            memset(vip, 0, sizeof(vip));
-
-            ret = _vipPool->allocateVip(vip, &vipLen);
-            if (ret != 0)
-            {
-                LOG_ERROR("allocate vip fail\n");
-                return -1;
-            }
-            *(vip + vipLen) = '\0';
-            svip = ipInt2String(_vipPool->getVip());
-            cvip = vip;
-            cidr = _vipPool->getipv4net();
-            cmaskPrefixLen = _vipPool->getipv4netmask();
-        }
-
-        // 记录分配的虚拟ip与ssl对应关系
-        ch->setVip((char*)cvip.c_str());
-        if (_isVirtualIpv6) ch->setVip6((char*)removePrefixFromIPv6(cvip6).c_str());
-        // 记录分配的虚拟ip和channel对应关系
-        bool res = false;
-        if (_isVirtualIpv6)
-        {
-            res = addVIPChannel(removePrefixFromIPv6(cvip6), ch);
-            if (!res)
-            {
-                LOG_ERROR("addMaps %s fail\n", removePrefixFromIPv6(cvip6).c_str());
-                return -1;
-            }
-        }
-        res = addVIPChannel(cvip, ch);
-        if (!res)
-        {
-            LOG_ERROR("addMaps %s fail\n", cvip.c_str());
-            return -1;
-        }
-        LOG_INFO("allocate vip[%s] success\n", cvip.c_str());
-
-        // 创建配置json
-        root = cJSON_CreateObject();
-        cJSON_AddNumberToObject(root, "global", _vipPool->_globalBlock);
-        cJSON_AddNumberToObject(root, "mtu", _mtu);
-        cJSON_AddStringToObject(root, "svip", svip.c_str());
-        cJSON_AddStringToObject(root, "cvip", cvip.c_str());
-        cJSON_AddStringToObject(root, "cidr", cidr.c_str());
-        cJSON_AddStringToObject(root, "cmask", cmaskPrefixLen.c_str());
-        if (_isVirtualIpv6)
-        {
-            cJSON_AddStringToObject(root, "svip6", svip6.c_str());
-            cJSON_AddStringToObject(root, "cvip6", cvip6.c_str());
-            cJSON_AddStringToObject(root, "cidr6", cidr6.c_str());
-            cJSON_AddStringToObject(root, "cmask6", config()->_virtualIpv6Mask.c_str());
-        }
-        cJSON_AddStringToObject(root, "dns", _dns.c_str());
-        char* str = cJSON_PrintUnformatted(root);
-        cJSON_Delete(root);
-        LOG_INFO("推送TUN配置: %s\n", str);
-
-        // 封装数据
-        memset(conf, 0, sizeof(conf));
-        memcpy(conf, RECORD_TYPE_CONTROL_TUN_CONFIG, RECORD_TYPE_LABEL_LEN);
-        memcpy(conf + RECORD_TYPE_LABEL_LEN, str, strlen(str));
-
-        enpack(RECORD_TYPE_CONTROL, conf, strlen(str) + RECORD_TYPE_LABEL_LEN, packet, &enpackLen);
-
-        // 推送数据 TODO 发送数据不全需要处理
-        ch->mutex_.lock();
-        if (ch->ssl_ != NULL && !ch->isDeleted_) writeLen = SSL_write(ssl, packet, enpackLen);
-        ch->mutex_.unlock();
-        if (writeLen <= 0)
-        {
-            LOG_ERROR("网卡配置[%s]推送失败! 错误码: %d, 错误信息: '%s'\n", conf, errno, strerror(errno));
-            return -1;
-        }
-
-        LOG_DEBUG("SSLThread::%s end\n", __FUNCTION__);
-        return 0;
-    }
-
-    int SSLThread::pushAccountConf(Channel* ch)
-    {
-        LOG_DEBUG("SSLThread::%s\n", __FUNCTION__);
-        // 获取账号安全配置信息
-        SECURITY_T security = FileManager::getInstance()->getSecurityInfo();
-        unsigned int pwdSurvivalDay = ch->passwordExpiredTime_ <= security.passwordValidDay
-                                          ? ch->passwordExpiredTime_
-                                          : security.passwordValidDay;
-
-        // 认证结果
-        int code = 0;
-        std::string msg;
-        // 创建JSON
-        cJSON* root = NULL;
-        root = cJSON_CreateObject();
-        cJSON_AddNumberToObject(root, "keepaliveInterval", config()->_iKeepaliveInterval); // 心跳间隔时间
-        cJSON_AddNumberToObject(root, "keepaliveTimeout", config()->_iKeepaliveTimeout); // 心跳超时时间
-        cJSON_AddNumberToObject(root, "loginTimeout", security.loginTimeout); // 无操作登出时间
-        cJSON_AddNumberToObject(root, "loginOutFlow", security.loginOutFlow); // 无操作登出流量
-        cJSON_AddStringToObject(root, "pwdRule", security.pwdRole.c_str()); // 密码规则
-        cJSON_AddNumberToObject(root, "pwdSurvivalDay", pwdSurvivalDay); // 密码到期时间(单位: 天)
-        cJSON_AddNumberToObject(root, "pwdStatus", ch->passwordExpired_); // 密码是否过期，0-正常 1-过期
-        cJSON_AddNumberToObject(root, "pwdValidPeriod", security.passwordValidDay); // 密码设置有效期(天)
-        cJSON_AddNumberToObject(root, "logLevel", 1); // 日志级别(0~3 debug/info/warn/error)
-        cJSON_AddStringToObject(root, "helpMsg", "help msg"); // 帮助对话框消息提示信息
-        msg = cJSON_PrintUnformatted(root);
-        cJSON_Delete(root);
-        root = NULL;
-        LOG_INFO("推送账户配置: %s\n", msg.c_str());
-
-        // 封装数据
-        unsigned char conf[512] = {0};
-        unsigned char packet[514] = {0};
-        unsigned int enpackLen = sizeof(packet);
-        memset(conf, 0, sizeof(conf));
-        memcpy(conf, RECORD_TYPE_CONTROL_AUTH_CONFIG, RECORD_TYPE_LABEL_LEN);
-        memcpy(conf + RECORD_TYPE_LABEL_LEN, msg.data(), msg.length());
-        enpack(RECORD_TYPE_CONTROL, conf, msg.length() + RECORD_TYPE_LABEL_LEN, packet, &enpackLen);
-
-        // 发送数据
-        int wlen = 0;
-        ch->mutex_.lock();
-        if (ch->ssl_ != NULL && !ch->isDeleted_) wlen = SSL_write(ch->ssl_, packet, enpackLen);
-        ch->mutex_.unlock();
-        if (wlen <= 0)
-        {
-            LOG_INFO("推送失败! 错误码: %d, 错误信息: '%s'\n", errno, strerror(errno));
-            return -1;
-        }
-        LOG_INFO("SSLThread::%s success\n", __FUNCTION__);
-        return 0;
-    }
-
-    int SSLThread::pushRouteConf(Channel* ch)
-    {
-        LOG_DEBUG("SSLThread::%s\n", __FUNCTION__);
-        // 查询IPv4路由配置表
-        std::string ipv4Route = FileManager::getInstance()->getRouteInfo(ch->username_);
-        LOG_INFO("IPv4路由配置: %s\n", ipv4Route.c_str());
-        // 认证结果
-        int code = 0;
-        bool isVirtualIpv6 = config()->_isVirtualIpv6;
-        std::string msg;
-        // 创建JSON
-        cJSON* root = NULL;
-        root = cJSON_CreateObject();
-        // cJSON_AddStringToObject(root, "ipv4_route", config()->_pushRoute.c_str());       // 推送IPv4路由(已废弃,改由查询获取)
-        cJSON_AddStringToObject(root, "ipv4_route", ipv4Route.c_str()); // 推送IPv4路由
-        if (isVirtualIpv6) cJSON_AddStringToObject(root, "ipv6_route", config()->_pushRoute6.c_str()); // 推送IPv6路由
-#if 1   // 正式环境不使用
-        std::string resource_msg = FileManager::getInstance()->getClientResourceRuleInfo(ch->username_);
-        if (resource_msg.length() > 0)
-        {
-            cJSON_AddStringToObject(root, "access_resource", resource_msg.c_str());
-        }
-#endif
-        msg = cJSON_PrintUnformatted(root);
-        cJSON_Delete(root);
-        root = NULL;
-        // 判断推送路由长度是否超过20480(8000 = 100 * (32 + 48))
-        if (msg.length() > 8000)
-        {
-            LOG_ERROR("推送路由配置超过8000字节, 推送失败!\n");
-            return -1;
-        }
-        LOG_INFO("推送路由配置: %s\n", msg.c_str());
-
-        // 封装数据
-        unsigned char conf[10240] = {0};
-        unsigned char packet[10240] = {0};
-        unsigned int enpackLen = sizeof(packet);
-        memset(conf, 0, sizeof(conf));
-        memcpy(conf, RECORD_TYPE_CONTROL_ROUTE_CONFIG, RECORD_TYPE_LABEL_LEN);
-        memcpy(conf + RECORD_TYPE_LABEL_LEN, msg.data(), msg.length());
-        enpack(RECORD_TYPE_CONTROL, conf, msg.length() + RECORD_TYPE_LABEL_LEN, packet, &enpackLen);
-
-        // 发送数据
-        int wlen = 0;
-        ch->mutex_.lock();
-        if (ch->ssl_ != NULL && !ch->isDeleted_) wlen = SSL_write(ch->ssl_, packet, enpackLen);
-        ch->mutex_.unlock();
-        if (wlen <= 0)
-        {
-            LOG_INFO("推送失败! 错误码: %d, 错误信息: '%s'\n", errno, strerror(errno));
-            return -1;
-        }
-        LOG_INFO("SSLThread::%s success\n", __FUNCTION__);
-        return 0;
-    }
-
-    int SSLThread::pushNet2NetConf(Channel* ch)
-    {
-        LOG_DEBUG("SSLThread::%s\n", __FUNCTION__);
-        // 获取账号安全配置信息
-        SECURITY_T security = FileManager::getInstance()->getSecurityInfo();
-        unsigned int pwdSurvivalDay = ch->passwordExpiredTime_ <= security.passwordValidDay
-                                          ? ch->passwordExpiredTime_
-                                          : security.passwordValidDay;
-
-        // 认证结果
-        int code = 0;
-        std::string msg;
-        // 创建JSON
-        cJSON* root = NULL;
-        root = cJSON_CreateObject();
-        cJSON_AddNumberToObject(root, "keepaliveInterval", config()->_iKeepaliveInterval); // 心跳间隔时间
-        cJSON_AddNumberToObject(root, "loginTimeout", security.loginTimeout); // 无操作登出时间
-        msg = cJSON_PrintUnformatted(root);
-        cJSON_Delete(root);
-        root = NULL;
-        LOG_INFO("推送Net2Net配置: %s\n", msg.c_str());
-        // 封装数据
-        unsigned char conf[512] = {0};
-        unsigned char packet[514] = {0};
-        unsigned int enpackLen = sizeof(packet);
-        memset(conf, 0, sizeof(conf));
-        memcpy(conf, RECORD_TYPE_NET2NET_CONFIG, RECORD_TYPE_LABEL_LEN);
-        memcpy(conf + RECORD_TYPE_LABEL_LEN, msg.data(), msg.length());
-        enpack(RECORD_TYPE_NET2NET, conf, msg.length() + RECORD_TYPE_LABEL_LEN, packet, &enpackLen);
-
-        // 发送数据
-        int wlen = 0;
-        ch->mutex_.lock();
-        if (ch->ssl_ != NULL && !ch->isDeleted_) wlen = SSL_write(ch->ssl_, packet, enpackLen);
-        ch->mutex_.unlock();
-        if (wlen <= 0)
-        {
-            LOG_INFO("推送失败! 错误码: %d, 错误信息: '%s'\n", errno, strerror(errno));
-            return -1;
-        }
-        LOG_INFO("SSLThread::%s success\n", __FUNCTION__);
-        return 0;
-    }
-
-    char* SSLThread::ipInt2String(int ip_addr)
-    {
-        LOG_DEBUG("SSLThread::%s\n", __FUNCTION__);
-        struct in_addr var_ip;
-        var_ip.s_addr = htonl(ip_addr);
-        return inet_ntoa(var_ip);
-    }
-
-    void SSLThread::addRecvFdToEpollFd()
+    void SslWorkThread::addRecvFdToEpollFd()
     {
         LOG_DEBUG("SSLThread::%s\n", __FUNCTION__);
         struct epoll_event ev;
@@ -1254,332 +968,8 @@ namespace VPN
         }
     }
 
-    std::string SSLThread::timestampToDateTime(time_t rawtime)
-    {
-        if (rawtime <= 0 || rawtime > 2147483647)
-        {
-            // 如果时间戳非法，返回空字符串。
-            return std::string("");
-        }
-        struct tm* dt;
-        char buffer[80];
-        dt = localtime(&rawtime);
-        strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", dt);
-        std::string str(buffer);
-        return str;
-    }
 
-    int SSLThread::accountLoginLimit(std::string user, std::string terminal, std::string sessionId, int& errcode,
-                                     std::string& errmsg)
-    {
-        cJSON* root_req = NULL;
-        root_req = cJSON_CreateObject();
-        cJSON_AddStringToObject(root_req, "username", user.c_str());
-        cJSON_AddStringToObject(root_req, "terminalType", terminal.c_str());
-        cJSON_AddStringToObject(root_req, "sessionId", sessionId.c_str());
-        char* jsondata = cJSON_PrintUnformatted(root_req);
-        cJSON_Delete(root_req);
-        LOG_DEBUG("request: %s\n", jsondata);
-        std::string response = httpRequest->httpsPost("/sslvpn/vpnServer/loginCheck/", jsondata);
-        // 字符串查找
-        std::size_t found = response.find("{");
-        if (found != std::string::npos)
-        {
-            response = response.substr(found);
-            LOG_DEBUG("response: %s\n", response.c_str());
-        }
-        else
-        {
-            LOG_ERROR("SSLThread::%s not found '{'.\n", __FUNCTION__);
-            return -1;
-        }
-        // 解析json
-        cJSON* root_res = cJSON_Parse(response.c_str());
-        if (root_res == NULL)
-        {
-            LOG_ERROR("SSLThread::%s parse json error\n", __FUNCTION__);
-            return -1;
-        }
-        cJSON* code = cJSON_GetObjectItem(root_res, "code");
-        if (code == NULL)
-        {
-            LOG_ERROR("SSLThread::%s not found code\n", __FUNCTION__);
-            return -1;
-        }
-        cJSON* msg = cJSON_GetObjectItem(root_res, "msg");
-        if (msg == NULL)
-        {
-            LOG_ERROR("SSLThread::%s not found msg\n", __FUNCTION__);
-            return -1;
-        }
-        ErrorInfo err = ERR_SUCCESS;
-        if (0 == code->valueint)
-        {
-            err = ERR_SUCCESS;
-        }
-        else if (2101 == code->valueint)
-        {
-            err = ERR_ACCOUNT_NOTFOUND;
-        }
-        else if (-68 == code->valueint)
-        {
-            err = ERR_TERMINAL_TYPE;
-        }
-        else if (-77 == code->valueint)
-        {
-            err = ERR_IPPOLL_FULL_1;
-        }
-        else if (-78 == code->valueint)
-        {
-            err = ERR_LOGIN_LIMIT;
-        }
-        else
-        {
-            err = ERR_UNKNOWN;
-        }
-        LOG_WARN("账号(%s)登录限制, 管理服务响应: errCode=%d, errMsg=%s\n", user.c_str(), code->valueint, msg->valuestring);
-        errcode = err.errCode;
-        errmsg = err.errMsg;
-        return 0;
-    }
-
-    int SSLThread::sendSmsCode(std::string& user, std::string& phone, int& errcode, std::string& errmsg)
-    {
-        ErrorInfo err = ERR_SUCCESS;
-        cJSON* root_req = NULL;
-        root_req = cJSON_CreateObject();
-        cJSON_AddStringToObject(root_req, "username", user.c_str());
-        cJSON_AddStringToObject(root_req, "phone", phone.c_str());
-        char* jsondata = cJSON_PrintUnformatted(root_req);
-        cJSON_Delete(root_req);
-        LOG_DEBUG("request: %s\n", jsondata);
-        std::string response = httpRequest->httpsPost("/sslvpn/vpnClient/sendPhoneCode", jsondata);
-        // 字符串查找
-        std::size_t found = response.find("{");
-        if (found != std::string::npos)
-        {
-            response = response.substr(found);
-            LOG_DEBUG("response: %s\n", response.c_str());
-        }
-        else
-        {
-            LOG_ERROR("sendSmsCode not found '{'.\n");
-            return -1;
-        }
-        // 解析json
-        cJSON* root_res = cJSON_Parse(response.c_str());
-        if (root_res == NULL)
-        {
-            LOG_ERROR("sendSmsCode parse json error\n");
-            return -1;
-        }
-        cJSON* code = cJSON_GetObjectItem(root_res, "code");
-        if (code == NULL)
-        {
-            LOG_ERROR("sendSmsCode not found code\n");
-            return -1;
-        }
-        cJSON* msg = cJSON_GetObjectItem(root_res, "msg");
-        if (msg == NULL)
-        {
-            LOG_ERROR("sendSmsCode not found msg\n");
-            return -1;
-        }
-        // 下发短信通知
-        if (0 == code->valueint)
-        {
-            err = ERR_SUCCESS;
-        }
-        else if (-11100 == code->valueint)
-        {
-            err = ERR_SMS_SEND_FAILED_1;
-        }
-        else if (-11101 == code->valueint)
-        {
-            err = ERR_SMS_SEND_FAILED_2;
-        }
-        else if (-11102 == code->valueint)
-        {
-            err = ERR_SMS_SEND_FAILED_3;
-        }
-        else if (-11103 == code->valueint)
-        {
-            err = ERR_SMS_SEND_FAILED_4;
-        }
-        else if (-11104 == code->valueint)
-        {
-            err = ERR_SMS_SEND_FAILED_5;
-        }
-        else if (-11105 == code->valueint)
-        {
-            err = ERR_SMS_SEND_FAILED_6;
-        }
-        else if (-11106 == code->valueint)
-        {
-            err = ERR_SMS_SEND_FAILED_7;
-        }
-        else if (-11107 == code->valueint)
-        {
-            err = ERR_SMS_SEND_FAILED_8;
-        }
-        else
-        {
-            err = ERR_SMS_SEND_FAILED_1;
-        }
-        errcode = err.errCode;
-        errmsg = err.errMsg;
-        return 0;
-    }
-
-    int SSLThread::modifyPassword(std::string user, std::string oldpass, std::string newpass, int& errcode,
-                                  std::string& errmsg)
-    {
-        cJSON* root_req = NULL;
-        root_req = cJSON_CreateObject();
-        cJSON_AddStringToObject(root_req, "username", user.c_str());
-        cJSON_AddStringToObject(root_req, "oldPassword", oldpass.c_str());
-        cJSON_AddStringToObject(root_req, "newPassword", newpass.c_str());
-        char* jsondata = cJSON_PrintUnformatted(root_req);
-        cJSON_Delete(root_req);
-        LOG_DEBUG("request: %s\n", jsondata);
-        std::string response = httpRequest->httpsPost("/sslvpn/vpnClient/updatePwd", jsondata);
-        // 字符串查找
-        std::size_t found = response.find("{");
-        if (found != std::string::npos)
-        {
-            response = response.substr(found);
-            LOG_DEBUG("response: %s\n", response.c_str());
-        }
-        else
-        {
-            LOG_ERROR("modifyPassword not found '{'.\n");
-            return -1;
-        }
-        // 解析json
-        cJSON* root_res = cJSON_Parse(response.c_str());
-        if (root_res == NULL)
-        {
-            LOG_ERROR("modifyPassword parse json error\n");
-            return -1;
-        }
-        cJSON* code = cJSON_GetObjectItem(root_res, "code");
-        if (code == NULL)
-        {
-            LOG_ERROR("modifyPassword not found code\n");
-            return -1;
-        }
-        cJSON* msg = cJSON_GetObjectItem(root_res, "msg");
-        if (msg == NULL)
-        {
-            LOG_ERROR("modifyPassword not found msg\n");
-            return -1;
-        }
-        ErrorInfo err = ERR_SUCCESS;
-        if (0 == code->valueint)
-        {
-            err = ERR_SUCCESS;
-        }
-        else if (-10000 == code->valueint)
-        {
-            err = ERR_MODIFY_PASS_FAILED_1;
-        }
-        else if (-10001 == code->valueint)
-        {
-            err = ERR_MODIFY_PASS_FAILED_2;
-        }
-        else if (-10002 == code->valueint)
-        {
-            err = ERR_MODIFY_PASS_FAILED_3;
-        }
-        else if (-10003 == code->valueint)
-        {
-            err = ERR_MODIFY_PASS_FAILED_4;
-        }
-        else if (-10004 == code->valueint)
-        {
-            err = ERR_MODIFY_PASS_FAILED_5;
-        }
-        else if (-10004 == code->valueint)
-        {
-            err = ERR_MODIFY_PASS_FAILED_6;
-        }
-        else
-        {
-            err = ERR_MODIFY_PASS_FAILED_1;
-        }
-        errcode = err.errCode;
-        errmsg = err.errMsg;
-        return 0;
-    }
-
-    void SSLThread::clientResponse(Channel* ch, const unsigned char* protocol, int errCode, std::string errMsg)
-    {
-        LOG_INFO("SSLThread::%s\n", __FUNCTION__);
-        // 创建响应报文
-        std::string response_msg;
-        cJSON* response = NULL;
-        response = cJSON_CreateObject();
-        cJSON_AddNumberToObject(response, "errCode", errCode);
-        cJSON_AddStringToObject(response, "errMsg", errMsg.c_str());
-        response_msg = cJSON_PrintUnformatted(response);
-        cJSON_Delete(response);
-        LOG_INFO("response_msg: %s\n", response_msg.c_str());
-
-        // 封装响应数据包
-        unsigned char conf[512] = {0};
-        unsigned char packet[514] = {0};
-        unsigned int packetLen = sizeof(packet);
-        memset(conf, 0, sizeof(conf));
-        memcpy(conf, response_msg.data(), response_msg.length());
-        enpack(protocol, conf, response_msg.length(), packet, &packetLen);
-
-        // 发送响应数据包
-        int wlen = 0;
-        LOG_INFO("----->clientResponse %s\n", ch->clientId_);
-        ch->mutex_.lock();
-        LOG_INFO("----->clientResponse111 %s\n", ch->clientId_);
-        if (ch->ssl_ != NULL && !ch->isDeleted_) wlen = SSL_write(ch->ssl_, packet, packetLen);
-        LOG_INFO("----->clientResponse222 %s\n", ch->clientId_);
-
-        ch->mutex_.unlock();
-        if (wlen <= 0)
-        {
-            LOG_ERROR("发送失败! 错误码: %d, 错误信息: '%s'\n", errno, strerror(errno));
-            return;
-        }
-        LOG_INFO("SSLThread::%s success, wlen: %d\n", __FUNCTION__, wlen);
-    }
-
-    // 心跳响应包
-    void SSLThread::clientHeartBeat(Channel* ch)
-    {
-        // LOG_INFO("SSLThread::%s %s\n", __FUNCTION__, ch->clientId_);
-        // 创建响应报文
-        std::string response_msg = "heartbeat";
-        // LOG_INFO("response_msg: %s\n", response_msg.c_str());
-        // 封装响应数据包
-        unsigned char conf[512] = {0};
-        unsigned char packet[514] = {0};
-        unsigned int packetLen = sizeof(packet);
-        memset(conf, 0, sizeof(conf));
-        memcpy(conf, response_msg.data(), response_msg.length());
-        enpack(RECORD_TYPE_BEATS, conf, response_msg.length(), packet, &packetLen);
-
-        // 发送响应数据包
-        int wlen = 0;
-        ch->mutex_.lock();
-        if (ch->ssl_ != NULL && !ch->isDeleted_) wlen = SSL_write(ch->ssl_, packet, packetLen);
-        ch->mutex_.unlock();
-        if (wlen <= 0)
-        {
-            LOG_ERROR("客户端(%s)心跳响应包发送失败! 错误码: %d, 错误信息: '%s'\n", ch->clientId_, errno, strerror(errno));
-            return;
-        }
-        // LOG_INFO("SSLThread::%s 客户端(%s)心跳响应包发送成功.\n", __FUNCTION__, ch->clientId_);
-    }
-
-
-    int SSLThread::setnoblocking(int fd)
+    int SslWorkThread::setnoblocking(int fd)
     {
         LOG_DEBUG("SSLThread::%s\n", __FUNCTION__);
         int old_option = fcntl(fd,F_GETFL);
@@ -1588,7 +978,7 @@ namespace VPN
         return old_option;
     }
 
-    int SSLThread::setNonBlock(int fd, bool value)
+    int SslWorkThread::setNonBlock(int fd, bool value)
     {
         int flags = fcntl(fd, F_GETFL, 0);
         if (flags < 0)
@@ -1602,7 +992,7 @@ namespace VPN
         return fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
     }
 
-    int SSLThread::setEdgeTrigger(int fd)
+    int SslWorkThread::setEdgeTrigger(int fd)
     {
         // 设置文件描述符为非阻塞模式
         int flags = fcntl(fd, F_GETFL, 0);
@@ -1625,29 +1015,4 @@ namespace VPN
 
         return 0;
     }
-
-    // std::shared_ptr<Channel> SSLThread::findChannelMap(int fd)
-    // {
-    //     auto it = _channelMap.find(fd);
-    //     if(it != _channelMap.end())
-    //     {
-    //         return it->second;
-    //     }
-    //     else
-    //     {
-    //         return nullptr;
-    //     }
-    // }
-
-    // // 根据vip插在channel结构体指针
-    // Channel* SSLThread::findChannel(const char *ip)
-    // {
-    //     // LOG_DEBUG("SSLThread::%s\n", __FUNCTION__); // 日志太多，暂时注释掉
-    //     auto iter = maps.find(ip);
-    //     if (iter != maps.end()) {
-    //         return iter->second;
-    //     } else {
-    //         return nullptr;
-    //     }
-    // }
 }
