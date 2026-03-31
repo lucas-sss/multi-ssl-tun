@@ -12,6 +12,7 @@
 #include <ctime>
 #include <cctype>
 #include <string>
+#include <cstring>
 #include <chrono>
 #include <random>
 #include <sstream>
@@ -28,15 +29,17 @@
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <linux/sockios.h>
+#include <signal.h>
 
 #include "channel.h"
 #include "fd_dispatcher.h"
+#include "protocol.h"
 
 
 namespace VPN
 {
     static std::map<std::string, Channel*> vip_ch_map; // 用于存储所有连接的vip->channel
-    static std::map<std::string, Channel*> fd_ch_map; // 用于存储所有连接的fd->channel
+    static std::map<int, std::shared_ptr<Channel>> fd_ch_map; // 用于存储所有连接的fd->channel
 
     // channel map 线程安全调用处理
     static std::mutex vip_map_mtx; // 全局互斥锁
@@ -96,6 +99,53 @@ namespace VPN
         {
             return nullptr; // 或者其他错误处理
         }
+    }
+
+    void addFdChannel(int fd, std::shared_ptr<Channel> ch)
+    {
+        std::lock_guard<std::mutex> lock(fd_map_mtx);
+        fd_ch_map[fd] = ch;
+    }
+
+    void delFdChannel(int fd)
+    {
+        std::lock_guard<std::mutex> lock(fd_map_mtx);
+        fd_ch_map.erase(fd);
+    }
+
+    std::mutex& getFdChannelMutex()
+    {
+        return fd_map_mtx;
+    }
+
+    std::shared_ptr<Channel> findFdChannel(int fd)
+    {
+        std::lock_guard<std::mutex> lock(fd_map_mtx);
+        auto it = fd_ch_map.find(fd);
+        if (it == fd_ch_map.end())
+        {
+            return std::shared_ptr<Channel>();
+        }
+        return it->second;
+    }
+
+    std::string SslWorkThread::charsToHexString(unsigned char* data, unsigned int len)
+    {
+        static const char* hex = "0123456789abcdef";
+        std::string out;
+        out.reserve(len * 2);
+        for (unsigned int i = 0; i < len; ++i)
+        {
+            unsigned char b = data[i];
+            out.push_back(hex[(b >> 4) & 0x0F]);
+            out.push_back(hex[b & 0x0F]);
+        }
+        return out;
+    }
+
+    std::string SslWorkThread::charsToHexStr(unsigned char* data, unsigned int len)
+    {
+        return charsToHexString(data, len);
     }
 
 
@@ -234,113 +284,6 @@ namespace VPN
         LOG_INFO("SSL write thread : %ld end.....\n", _thread->get_id());
     }
 
-    bool SslWorkThread::getCertInfo(X509* cert, std::string& subject, std::string& issuer, std::string& serialNo,
-                                    std::string& fingerprint, std::string& pubXYString, std::string& validity)
-    {
-        if (cert != NULL)
-        {
-            // 获取证书主题信息
-            subject = X509_NAME_oneline(X509_get_subject_name(cert), 0, 0);
-            // 获取证书颁发者信息
-            issuer = X509_NAME_oneline(X509_get_issuer_name(cert), 0, 0);
-            // 获取证书序列号信息
-            ASN1_INTEGER* serialNumber = X509_get_serialNumber(cert);
-            if (!serialNumber)
-            {
-                return false;
-            }
-            // 转换序列号为字符串形式
-            char* serialNumberStr = i2s_ASN1_INTEGER(NULL, serialNumber);
-            if (!serialNumberStr)
-            {
-                return false;
-            }
-            serialNo = serialNumberStr;
-            OPENSSL_free(serialNumberStr); // 释放由i2s_ASN1_INTEGER分配的内存
-            // 获取证书指纹信息
-            unsigned int len = 20;
-            unsigned char tmpbuff[32] = {0};
-            if (X509_digest(cert, EVP_sha1(), tmpbuff, &len) != 1)
-            {
-                return false;
-            }
-            fingerprint = charsToHexString(tmpbuff, len);
-            // 获取客户端公钥信息
-            EVP_PKEY* pkey = X509_get_pubkey(cert);
-            if (pkey)
-            {
-                if (EVP_PKEY_base_id(pkey) == EVP_PKEY_EC)
-                {
-                    const EC_KEY* ec_key = EVP_PKEY_get0_EC_KEY(pkey);
-                    if (ec_key)
-                    {
-                        const EC_POINT* point = EC_KEY_get0_public_key(ec_key);
-                        if (point)
-                        {
-                            const EC_GROUP* group = EC_KEY_get0_group(ec_key);
-                            if (group)
-                            {
-                                BIGNUM* x = BN_new();
-                                BIGNUM* y = BN_new();
-                                if (x && y && EC_POINT_get_affine_coordinates_GFp(group, point, x, y, NULL))
-                                {
-                                    char* x_str = BN_bn2hex(x);
-                                    char* y_str = BN_bn2hex(y);
-                                    if (x_str && y_str)
-                                    {
-                                        pubXYString = std::string(x_str) + std::string(y_str);
-                                        LOG_INFO("pubXYString: %s\n", pubXYString.c_str());
-                                    }
-                                    OPENSSL_free(x_str);
-                                    OPENSSL_free(y_str);
-                                }
-                                // 确保 x 和 y 在所有情况下都被释放
-                                BN_free(x);
-                                BN_free(y);
-                            }
-                        }
-                    }
-                }
-                EVP_PKEY_free(pkey);
-            }
-            // 证书有效期范围信息
-            ASN1_TIME* notBefore = X509_get_notBefore(cert);
-            ASN1_TIME* notAfter = X509_get_notAfter(cert);
-            time_t nowTime = time(NULL);
-            time_t iStartTime = convert_ASN1TIME_to_time_t(notBefore);
-            time_t iEndTime = convert_ASN1TIME_to_time_t(notAfter);
-            char startTime[20] = {0}, endTime[20] = {0};
-            if (iStartTime > 0 && iStartTime <= 4294967295)
-            {
-                strftime(startTime, sizeof(startTime), "%Y-%m-%d %H:%M:%S", localtime(&iStartTime));
-                if (nowTime < iStartTime)
-                {
-                    LOG_WARN("SSLThread::%s 客户端证书尚未生效.\n", __FUNCTION__);
-                }
-            }
-            else
-            {
-                memcpy(startTime, "null", 4);
-            }
-            if (iEndTime > 0 && iEndTime <= 4294967295)
-            {
-                strftime(endTime, sizeof(endTime), "%Y-%m-%d %H:%M:%S", localtime(&iEndTime));
-                if (nowTime > iEndTime)
-                {
-                    LOG_WARN("SSLThread::%s 客户端证书已经过期.\n", __FUNCTION__);
-                }
-            }
-            else
-            {
-                memcpy(endTime, "null", 4);
-            }
-            validity = std::string(startTime) + " -> " + std::string(endTime);
-            return true;
-        }
-        return false;
-    }
-
-
     void SslWorkThread::handleRead(Channel* ch)
     {
         if (ch->sslConnected_)
@@ -413,7 +356,6 @@ namespace VPN
         ch->mutex_.unlock();
         if (r == 1)
         {
-            showClientCerts(ch->ssl_); // 此处不展示证书信息
             ch->sslConnected_ = true;
             ch->tfd_ = _tunWriteFd;
             LOG_INFO("new ssl: %p for fd: %d\n", ch->ssl_, ch->fd_);
@@ -454,6 +396,7 @@ namespace VPN
         int ret = 0;
         unsigned char packet[MAX_BUF_LEN] = {0};
         unsigned int depack_len = 0;
+
         signal(SIGPIPE, SIG_IGN);
         if (ch->next == NULL)
         {
@@ -463,7 +406,8 @@ namespace VPN
 
         int rlen = 0;
         ch->mutex_.lock();
-        if (ch->ssl_) rlen = SSL_read(ch->ssl_, ch->next + ch->next_len, MAX_BUF_LEN - ch->next_len);
+        if (ch->ssl_)
+            rlen = SSL_read(ch->ssl_, ch->next + ch->next_len, MAX_BUF_LEN - ch->next_len);
         ch->mutex_.unlock();
         if (rlen > 0)
         {
@@ -476,8 +420,6 @@ namespace VPN
                 // 判定数据类型
                 if (memcmp(packet, RECORD_TYPE_DATA, RECORD_TYPE_LABEL_LEN) == 0) // vpn数据
                 {
-                    // LOG_INFO("客户端数据消息: isIPv6_: %d, ch->tfd_: %d\n", ch->isIPv6_, ch->tfd_);
-                    // 解析认证类型
                     if (datalen < (int)RECORD_HEADER_LEN)
                     {
                         continue;
@@ -507,20 +449,6 @@ namespace VPN
                         continue;
                     }
                     // TODO 判断认证消息类型
-                    if (datalen > (int)HEADER_LEN)
-                        LOG_INFO("客户端登录认证协议: [%02x][%02x] [%02x][%02x]\n", packet[0], packet[1], packet[6], packet[7]);
-                    // 客户端登录认证
-                    if (memcmp(packet + 6, RECORD_TYPE_AUTH_ACCOUNT, RECORD_TYPE_LABEL_LEN) == 0)
-                    {
-                        LOG_DEBUG("客户端登录认证: %s\n", packet+HEADER_LEN);
-                        // 解析认证数据，判断认证结果，响应客户端，成功推送tun配置
-                        if (false == clientLoginAuth(ch, (char*)(packet + HEADER_LEN)))
-                        {
-                            LOG_WARN("客户端登录认证失败, 关闭连接.\n");
-                            // ...
-                        }
-                        break;
-                    }
                 }
                 else
                 {
@@ -616,15 +544,14 @@ namespace VPN
     {
         LOG_DEBUG("SSLThread::%s\n", __FUNCTION__);
         int r;
-        bool useTLS13 = false;
-        std::string signcert = config()->_tlsSigCert; // "certs/signcert.crt";
-        std::string signkey = config()->_tlsSigKey; // "certs/signkey.key";
-        std::string enccert = config()->_tlsEncCert; // "certs/enccert.crt";
-        std::string enckey = config()->_tlsEncKey; // "certs/enckey.key";
-        std::string cert = config()->_tlsCert; // "certs/server.pem";
-        std::string key = config()->_tlsKey; // "certs/server.pem";
-        std::string keypass = config()->_tlsKeyPass; // 证书私钥密码
-        std::string tlsCipher = config()->_tlsCipher.c_str(); // 设置密码套件
+        std::string ca = "./certs/ca.crt";
+        std::string crl;
+        std::string signcert = "./certs/signcert.crt";
+        std::string signkey = "./certs/signkey.key";
+        std::string enccert = "./certs/enccert.crt";
+        std::string enckey = "./certs/enckey.key";
+        std::string cert = "./certs/server.pem";
+        std::string key = "./certs/server.pem";
 
         SSL_load_error_strings();
         r = SSL_library_init();
@@ -635,99 +562,47 @@ namespace VPN
         }
         _errBio = BIO_new_fd(2, BIO_NOCLOSE);
 
-        if (config()->_tlsCipherFlag == "RSA")
-        {
-            _sslCtx = SSL_CTX_new(SSLv23_method()); // 支持TLS1.0及以上版本
-            // _sslCtx = SSL_CTX_new(TLS_server_method());  // 支持TLS协议版本
-            // _sslCtx = SSL_CTX_new(DTLS_server_method()); // 支持DTLS协议版本
-            if (_sslCtx == NULL)
-            {
-                LOG_INFO("SSL_CTX_new failed\n");
-                exit(1);
-            }
-        }
-        else if (config()->_tlsCipherFlag == "SM2")
-        {
 #ifdef SDF_ENGINE_ENABLED
-            // 判断是否启用加密卡
-            if (config()->useEngineSdf)
+        // 判断是否启用加密卡
+        if (config()->useEngineSdf)
+        {
+            LOG_INFO("使用引擎库调用加密卡.\n");
+            ENGINE* e = register_engine();
+            if (e == NULL)
             {
-                LOG_INFO("使用引擎库调用加密卡.\n");
-                ENGINE* e = register_engine();
-                if (e == NULL)
-                {
-                    LOG_ERROR("register_engine error.\n");
-                    exit(1);
-                }
-                // 这里增加密码卡/密码机调用检测
-            }
-#endif
-            _sslCtx = SSL_CTX_new(NTLS_server_method()); // 双证书相关server的各种定义
-            if (_sslCtx == NULL)
-            {
-                LOG_INFO("SSL_CTX_new failed\n");
+                LOG_ERROR("register_engine error.\n");
                 exit(1);
             }
-            SSL_CTX_enable_ntls(_sslCtx); // 允许使用国密双证书功能
+            // 这里增加密码卡/密码机调用检测
         }
-        else
+#endif
+        LOG_WARN("当前构建环境不启用NTLS，回退到SSLv23_method.\n");
+        _sslCtx = SSL_CTX_new(SSLv23_method());
+        if (_sslCtx == NULL)
         {
-            LOG_ERROR("不支持的密码套件.\n");
+            LOG_INFO("SSL_CTX_new failed\n");
             exit(1);
         }
-        // 设置密码套件
-        if (tlsCipher.size() > 0)
+        // "ECC-SM2-SM4-CBC-SM3:ECDHE-SM2-SM4-CBC-SM3:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384"
+        r = SSL_CTX_set_cipher_list(_sslCtx, "ECC-SM2-SM4-CBC-SM3");
+        if (r != 1)
         {
-            LOG_INFO("使用密码套件列表: %s\n", tlsCipher.c_str());
-            r = SSL_CTX_set_cipher_list(_sslCtx, tlsCipher.c_str());
-        }
-        else
-        {
-            LOG_INFO("使用内置默认密码套件\n");
-            // "ECC-SM2-SM4-CBC-SM3:ECDHE-SM2-SM4-CBC-SM3:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384"
-            r = SSL_CTX_set_cipher_list(
-                _sslCtx,
-                "ECC-SM2-SM4-CBC-SM3:ECDHE-SM2-SM4-CBC-SM3:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384");
-            // if(r != 1) {
-            //     LOG_ERROR("SSL_CTX_set_cipher_list failed\n");
-            //     exit(1);
-            // }
+            LOG_ERROR("SSL_CTX_set_cipher_list failed\n");
+            exit(1);
         }
         SSL_CTX_set_options(_sslCtx, SSL_OP_CIPHER_SERVER_PREFERENCE);
 
         // 是否校验客户端
-        if (_verifyClient & !_ca.empty())
+        if (!ca.empty())
         {
-            LOG_INFO("开启客户端证书认证 %s\n", _ca.c_str());
+            LOG_INFO("开启客户端证书认证. %s\n", ca.c_str());
             SSL_CTX_set_verify(_sslCtx, SSL_VERIFY_PEER, verifyCallback); // 验证客户端证书回调；
             // SSL_CTX_set_verify(_sslCtx, SSL_VERIFY_CLIENT_ONCE, verifyCallback); // 仅在第一次交互时验证客户端证书
             // SSL_CTX_set_verify_depth(_sslCtx, 0);
-            r = SSL_CTX_load_verify_locations(_sslCtx, _ca.c_str(), NULL);
+            r = SSL_CTX_load_verify_locations(_sslCtx, NULL, ca.c_str());
             if (r <= 0)
             {
-                ERR_print_errors_fp(stderr);
-                LOG_ERROR("SSL_CTX_load_verify_locations %s failed\n", _ca.c_str());
-                exit(1);
-            }
-            ERR_clear_error();
-            STACK_OF(X509_NAME)* list = SSL_load_client_CA_file(_ca.c_str());
-            if (list == NULL)
-            {
-                LOG_ERROR("SSL_load_client_CA_file %s failed\n", _ca.c_str());
-                exit(1);
-            }
-            SSL_CTX_set_client_CA_list(_sslCtx, list);
-        }
-        else if (_verifyClient & !_capath.empty())
-        {
-            LOG_INFO("开启客户端证书认证. %s\n", _capath.c_str());
-            SSL_CTX_set_verify(_sslCtx, SSL_VERIFY_PEER, verifyCallback); // 验证客户端证书回调；
-            // SSL_CTX_set_verify(_sslCtx, SSL_VERIFY_CLIENT_ONCE, verifyCallback); // 仅在第一次交互时验证客户端证书
-            // SSL_CTX_set_verify_depth(_sslCtx, 0);
-            r = SSL_CTX_load_verify_locations(_sslCtx, NULL, _capath.c_str());
-            if (r <= 0)
-            {
-                LOG_ERROR("SSL_CTX_load_verify_locations %s failed\n", _capath.c_str());
+                LOG_ERROR("SSL_CTX_load_verify_locations %s failed\n", ca.c_str());
                 exit(1);
             }
         }
@@ -739,7 +614,7 @@ namespace VPN
 
 
         // 是否验证吊销证书
-        if (_crl.size() > 0)
+        if (!crl.empty())
         {
             X509_STORE* store = NULL;
             X509_LOOKUP* lookup = NULL;
@@ -756,20 +631,14 @@ namespace VPN
                 LOG_ERROR("X509_STORE_add_lookup() failed\n");
                 exit(1);
             }
-            r = X509_LOOKUP_load_file(lookup, _crl.c_str(), X509_FILETYPE_PEM);
+            r = X509_LOOKUP_load_file(lookup, crl.c_str(), X509_FILETYPE_PEM);
             if (r <= 0)
             {
-                LOG_ERROR("X509_LOOKUP_load_file %s failed\n", _crl.c_str());
+                LOG_ERROR("X509_LOOKUP_load_file %s failed\n", crl.c_str());
                 exit(1);
             }
             X509_STORE_set_flags(store, X509_V_FLAG_CRL_CHECK | X509_V_FLAG_CRL_CHECK_ALL);
             LOG_INFO("load _crl finish\n");
-        }
-
-        if (keypass.size() > 0)
-        {
-            // 如果证书私钥需要密码,设置回调
-            SSL_CTX_set_default_passwd_cb(_sslCtx, verifyPasswordCallback);
         }
 
         // 加载sm2证书
@@ -801,25 +670,6 @@ namespace VPN
                 exit(1);
             }
             LOG_INFO("SM2证书设置完成.\n");
-        }
-
-        // 这里判断是否需要加载RSA证书
-        if (!config()->_tlsCert.empty() && !config()->_tlsKey.empty())
-        {
-            // 加载rsa证书
-            r = SSL_CTX_use_certificate_file(_sslCtx, cert.c_str(), SSL_FILETYPE_PEM);
-            if (r <= 0)
-            {
-                LOG_ERROR("SSL_CTX_use_certificate_file %s failed\n", cert.c_str());
-                exit(1);
-            }
-            r = SSL_CTX_use_PrivateKey_file(_sslCtx, key.c_str(), SSL_FILETYPE_PEM);
-            if (r <= 0)
-            {
-                LOG_ERROR("SSL_CTX_use_PrivateKey_file %s failed\n", key.c_str());
-                exit(1);
-            }
-            LOG_INFO("RSA证书设置完成\n");
         }
 
         r = SSL_CTX_check_private_key(_sslCtx);
@@ -855,43 +705,14 @@ namespace VPN
     int SslWorkThread::verifyCallback(int preverify_ok, X509_STORE_CTX* x509_ctx)
     {
         LOG_INFO("SSLThread::%s preverify_ok: %d\n", __FUNCTION__, preverify_ok);
-        // 获取客户端证书信息
-        std::string subject, issuer, serialNo, fingerprint, pubXYString, validity;
-        X509* cert = X509_STORE_CTX_get_current_cert(x509_ctx);
-        if (getCertInfo(cert, subject, issuer, serialNo, fingerprint, pubXYString, validity))
-        {
-            LOG_INFO("客户端证书信息:\n");
-            LOG_INFO("使用者: %s\n", subject.c_str());
-            LOG_INFO("颁发者: %s\n", issuer.c_str());
-            LOG_INFO("序列号: %s\n", serialNo.c_str());
-            LOG_INFO("指纹: %s\n", fingerprint.c_str());
-            LOG_INFO("公钥XY: %s\n", pubXYString.c_str());
-            LOG_INFO("有效期: %s\n", validity.c_str());
-        }
-        else
-        {
-            LOG_INFO("无证书信息!\n");
-        }
-
         // 获取证书验证错误的详细情况
         int err = X509_STORE_CTX_get_error(x509_ctx);
-        // int depth = X509_STORE_CTX_get_error_depth(x509_ctx);
         if (err == X509_V_ERR_CERT_HAS_EXPIRED)
         {
             // 忽略证书过期错误
             return 1;
         }
         return preverify_ok;
-    }
-
-    int SslWorkThread::verifyPasswordCallback(char* buf, int size, int rwflag, void* u)
-    {
-        LOG_DEBUG("SSLThread::%s\n", __FUNCTION__);
-        const char* pass = config()->_tlsKeyPass.c_str(); // 证书私钥密码
-        if (strlen(pass) > (size_t)size)
-            return -1;
-        strcpy(buf, pass);
-        return strlen(pass);
     }
 
     void SslWorkThread::createEpoll()
@@ -927,28 +748,6 @@ namespace VPN
         dispatchFd(msg._fd);
     }
 
-    void SslWorkThread::showClientCerts(SSL* ssl)
-    {
-        LOG_DEBUG("SSLThread::%s\n", __FUNCTION__);
-        // 获取客户端证书信息
-        std::string subject, issuer, serialNo, fingerprint, pubXYString, validity;
-        X509* cert = SSL_get_peer_certificate(ssl);
-        if (getCertInfo(cert, subject, issuer, serialNo, fingerprint, pubXYString, validity))
-        {
-            LOG_INFO("客户端证书信息:\n");
-            LOG_INFO("使用者: %s\n", subject.c_str());
-            LOG_INFO("颁发者: %s\n", issuer.c_str());
-            LOG_INFO("序列号: %s\n", serialNo.c_str());
-            LOG_INFO("指纹: %s\n", fingerprint.c_str());
-            LOG_INFO("公钥XY: %s\n", pubXYString.c_str());
-            LOG_INFO("有效期: %s\n", validity.c_str());
-        }
-        else
-        {
-            LOG_INFO("无证书信息!\n");
-        }
-    }
-
     void SslWorkThread::addRecvFdToEpollFd()
     {
         LOG_DEBUG("SSLThread::%s\n", __FUNCTION__);
@@ -960,7 +759,7 @@ namespace VPN
         ev.events = EPOLLIN; // 水平触发
         LOG_DEBUG("SSL Write thread adding rec fd %d events %ld\n", _recFd, ev.events);
         int r = epoll_ctl(_epollFd, EPOLL_CTL_ADD, _recFd, &ev);
-        setnoblocking(_recFd); // 设置为非阻塞 (临时测试注释掉)
+        setNonBlocking(_recFd); // 设置为非阻塞 (临时测试注释掉)
         if (r)
         {
             LOG_ERROR("epoll_ctl add failed[%d], %s\n", errno, strerror(errno));
@@ -969,27 +768,13 @@ namespace VPN
     }
 
 
-    int SslWorkThread::setnoblocking(int fd)
+    int SslWorkThread::setNonBlocking(int fd)
     {
         LOG_DEBUG("SSLThread::%s\n", __FUNCTION__);
         int old_option = fcntl(fd,F_GETFL);
         int new_option = old_option | O_NONBLOCK;
         fcntl(fd,F_SETFL, new_option);
         return old_option;
-    }
-
-    int SslWorkThread::setNonBlock(int fd, bool value)
-    {
-        int flags = fcntl(fd, F_GETFL, 0);
-        if (flags < 0)
-        {
-            return errno;
-        }
-        if (value)
-        {
-            return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-        }
-        return fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
     }
 
     int SslWorkThread::setEdgeTrigger(int fd)

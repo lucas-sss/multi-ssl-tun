@@ -8,8 +8,6 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include "logger.h"
-#include "tcpProxy.h"
-#include "global.h"
 
 
 #ifndef VPN_ChANNEL_H
@@ -38,7 +36,7 @@ namespace VPN
 
         unsigned char buf[MAX_BUF_LEN]; // 读写缓冲区(*next指向此缓存区)
         unsigned char* next; // 存放数据指针
-        int next_len; // 存放数据长度
+        unsigned int next_len; // 存放数据长度
         int clientPort_; // 客户端连接端口
 
         Channel(int epollfd, int fd, int events) : accept_fd_(0), buf{0}, clientPort_(0)
@@ -76,7 +74,7 @@ namespace VPN
 
         ~Channel()
         {
-            LOG_INFO("Channel->客户端(%s)已经从服务中移除(%d)\n", clientId_, fd_);
+            LOG_INFO("Channel->客户端(%s)已经从服务中移除(%d)\n", vip_, fd_);
             mutex_.lock();
             isDeleted_ = true;
             // 从epoll中删除
